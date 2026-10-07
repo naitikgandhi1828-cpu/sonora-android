@@ -1,0 +1,124 @@
+# Builds Sonora for Android and publishes the APK.
+#
+# The source arrives as one file, bundle/source.zip. This workflow unpacks
+# it, builds a signed APK with Gradle, and then:
+#   - puts Sonora.apk (or, if the build failed, build-log.txt) on the
+#     `builds` branch, so it can be downloaded with a plain link;
+#   - puts the unpacked source on the `source` branch, so the code can be
+#     read on GitHub like any other project.
+
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths: [ "bundle/**", ".github/workflows/build.yml" ]
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Unpack the source bundle
+        run: |
+          test -f bundle/source.zip || { echo "bundle/source.zip is missing"; exit 1; }
+          rm -rf project && mkdir project
+          unzip -q bundle/source.zip -d project
+          ls project
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Make sure the Android SDK pieces are installed
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" > /dev/null || true
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
+      - name: Build the APK
+        id: build
+        working-directory: project
+        run: |
+          set -o pipefail
+          TASKS=":app:assembleRelease"
+          if [ -f TOOLKIT ]; then TASKS="$TASKS :app:testReleaseUnitTest"; fi
+          gradle --no-daemon --stacktrace $TASKS 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Collect the result
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          APK="project/app/build/outputs/apk/release/app-release.apk"
+          if [ -f "$APK" ]; then
+            cp "$APK" "$RUNNER_TEMP/out/Sonora.apk"
+            ls -lh "$RUNNER_TEMP/out/Sonora.apk"
+          fi
+          if [ -f "$RUNNER_TEMP/build.log" ]; then
+            # Compiler errors first, then the end of the log.
+            { echo "=== errors ==="; grep -E "^e: |^w: .*deprecat|error:|FAILED|What went wrong" -A3 "$RUNNER_TEMP/build.log" | head -400;
+              echo; echo "=== last lines ==="; tail -120 "$RUNNER_TEMP/build.log"; } > "$RUNNER_TEMP/out/build-log.txt" || true
+          fi
+
+      - name: Publish the toolkit (only when the bundle asks for it)
+        if: success() && hashFiles('project/TOOLKIT') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NAME="$(cat project/TOOLKIT | tr -d '[:space:]')"
+          cd "$RUNNER_TEMP"
+          mkdir -p toolkit/gradle-cache toolkit/android-sdk/platforms toolkit/android-sdk/build-tools
+          cp -R "$HOME/.gradle/caches/modules-2" toolkit/gradle-cache/
+          rm -f toolkit/gradle-cache/modules-2/*.lock toolkit/gradle-cache/modules-2/gc.properties
+          cp -R "$ANDROID_HOME/platforms/android-35" toolkit/android-sdk/platforms/
+          cp -R "$ANDROID_HOME/build-tools/35.0.0" toolkit/android-sdk/build-tools/
+          cp -R "$ANDROID_HOME/licenses" toolkit/android-sdk/ || true
+          tar czf toolkit.tar.gz toolkit
+          ls -lh toolkit.tar.gz
+          # Release assets are limited to 2 GB each; split to be safe.
+          split -b 1500m -d toolkit.tar.gz toolkit.tar.gz.part
+          gh release delete "$NAME" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "$NAME" toolkit.tar.gz.part* --repo "$GITHUB_REPOSITORY" \
+            --title "$NAME" --notes "Build tools snapshot used for local checks. Not the app."
+
+      - name: Publish the APK or the log to the builds branch
+        if: always()
+        run: |
+          set -e
+          cd "$RUNNER_TEMP/out"
+          ls -la
+          git init -q -b builds
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Build from ${GITHUB_SHA::7} (run ${GITHUB_RUN_NUMBER})" || { echo "nothing to publish"; exit 0; }
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" HEAD:builds
+
+      - name: Publish the unpacked source to the source branch
+        if: always()
+        run: |
+          set -e
+          cd project
+          rm -rf .git app/build build .gradle
+          git init -q -b source
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Source from ${GITHUB_SHA::7} (run ${GITHUB_RUN_NUMBER})"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" HEAD:source
